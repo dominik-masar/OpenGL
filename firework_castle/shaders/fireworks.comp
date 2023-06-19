@@ -1,0 +1,151 @@
+#version 450 core
+
+// The size of work group - 256 threads.
+layout (local_size_x = 256) in;
+
+// The structure holding the information about a single Phong light.
+struct PhongLight
+{
+	vec4 position;                   // The position of the light. Note that position.w should be one for point lights and spot lights, and zero for directional lights.
+	vec3 ambient;                    // The ambient part of the color of the light.
+	vec3 diffuse;                    // The diffuse part of the color of the light.
+	vec3 specular;                   // The specular part of the color of the light. 
+	vec3 spot_direction;             // The direction of the spot light, irrelevant for point lights and directional lights.
+	float spot_exponent;             // The spot exponent of the spot light, irrelevant for point lights and directional lights.
+	float spot_cos_cutoff;           // The cosine of the spot light's cutoff angle, -1 point lights, irrelevant for directional lights.
+	float atten_constant;            // The constant attenuation of spot lights and point lights, irrelevant for directional lights. For no attenuation, set this to 1.
+	float atten_linear;              // The linear attenuation of spot lights and point lights, irrelevant for directional lights.  For no attenuation, set this to 0.
+	float atten_quadratic;           // The quadratic attenuation of spot lights and point lights, irrelevant for directional lights. For no attenuation, set this to 0.
+};
+
+// ----------------------------------------------------------------------------
+// Input Variables
+// ----------------------------------------------------------------------------
+// The shader storage buffer with input positions.
+layout (std430, binding = 0) buffer PositionsInBuffer
+{
+	vec4 particle_positions[];
+};
+// The shader storage buffer with velocities.
+layout (std430, binding = 1) buffer VelocitiesBuffer
+{
+	vec4 particle_velocities[];
+};
+// The shader storage buffer with colors.
+layout (std430, binding = 2) buffer ColorsBuffer
+{
+	vec4 particle_colors[];
+};
+
+// The UBO with light data. Note that we use SSBO.
+layout (std430, binding = 3) buffer PhongLightsBuffer
+{
+	vec3 global_ambient_color;		 // The global ambient color.
+	int lights_count;				 // The number of lights in the buffer.
+	PhongLight lights[];			 // The array with actual lights.
+};
+
+// The particle count.
+uniform int current_particle_count;
+
+// The input parameters of the simulation.
+uniform float time_delta;
+uniform float gravity;
+uniform float elapsed_time;
+uniform int fireworks_count;
+uniform float rocket_spread;
+uniform float lifespan;
+uniform float min_initial_velocity;
+uniform float max_initial_velocity;
+uniform float init_delay;
+uniform float explosion_delay;
+uniform float explosion_thrust_time;
+uniform float explosion_force;
+uniform float explosion_light_delay;
+uniform float fade_delay;
+uniform float fade_time;
+uniform float blink_delay;
+uniform float blink_frequency;
+uniform float blink_ratio;
+
+// ----------------------------------------------------------------------------
+// Local Functions
+// ----------------------------------------------------------------------------
+
+// Noise function by Dave Hoskins.
+vec3 hash31(float p) {
+    vec3 p3 = fract(vec3(p) * vec3(.1031, .11369, .13787));
+    p3 += dot(p3, vec3(p3.y + 19.19, p3.z + 19.19, p3.x + 19.19));
+    return fract(vec3((p3.x + p3.y) * p3.z, (p3.x + p3.z) * p3.y, (p3.y + p3.z) * p3.x));
+}
+
+// ----------------------------------------------------------------------------
+// Main Method
+// ----------------------------------------------------------------------------
+void main()
+{
+    // init times
+    float time = mod(elapsed_time, lifespan);
+    float explosion_start_time = init_delay + explosion_delay;
+    float explosion_end_time = explosion_start_time + explosion_thrust_time;
+    float fade_start_time = explosion_start_time + fade_delay;
+    float fade_end_time = fade_start_time + fade_time;
+    float blink_start_time = fade_start_time + blink_delay;
+
+	vec3 random_position = hash31(gl_GlobalInvocationID.x);
+    vec3 acceleration = vec3(0.f);
+
+    // init
+    if (time < init_delay) {
+        // color
+        vec3 clr = hash31(elapsed_time);
+        // positions
+        particle_positions[gl_GlobalInvocationID.x] = vec4(0.0, 0.0, 0.0, 1.0);
+        // velocities
+        vec3 random_direction = hash31(elapsed_time);
+        float new_x = random_direction.x * 2 * rocket_spread - rocket_spread;
+        float new_y = min_initial_velocity + random_direction.y * (max_initial_velocity - min_initial_velocity);
+        float new_z = random_direction.z * 2 * rocket_spread - rocket_spread;
+        particle_velocities[gl_GlobalInvocationID.x] = vec4(new_x, new_y, new_z, 0.0);
+        particle_colors[gl_GlobalInvocationID.x] = vec4(clr, 0.2);
+    }
+
+    // explosion
+    if (time > explosion_start_time && time < explosion_end_time) {
+        vec3 rand_vec = normalize(random_position * 2 - 1.0);
+        acceleration += rand_vec * explosion_force;
+    }
+
+    // fading
+    if (time > explosion_start_time) {
+        float t = min((time - fade_delay) / (fade_time), 1.0);
+        float size = mix(1.0, 0.0, t);
+        particle_colors[gl_GlobalInvocationID.x].w = size;
+    }
+
+    vec3 position = vec3(particle_positions[gl_GlobalInvocationID.x]);
+	vec3 velocity = vec3(particle_velocities[gl_GlobalInvocationID.x]);
+    acceleration.y += gravity;
+
+    float t_delta = time_delta;
+    position += velocity * t_delta + 0.5 * acceleration * t_delta * t_delta;
+    velocity += acceleration * t_delta;
+    position.y = max(position.y, 0.0);
+
+    // Stores the result.
+	particle_positions[gl_GlobalInvocationID.x] = vec4(position, 1.0);
+	particle_velocities[gl_GlobalInvocationID.x] = vec4(velocity, 0.0);
+
+    barrier();
+    if(gl_GlobalInvocationID.x == 0){
+        vec3 position = vec3(0.0);
+        for (int i = 0; i < current_particle_count; i++) {
+            position += particle_positions[i].xyz;
+        }
+        position /= current_particle_count;
+        vec3 color = particle_colors[0].rgb * min(position.y, 1.0);
+        lights[0].position = vec4(position, 1.0);
+        lights[0].diffuse = color;
+        lights[0].specular = color;
+    }
+}
